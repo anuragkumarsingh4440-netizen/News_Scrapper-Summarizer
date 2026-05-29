@@ -20,6 +20,10 @@ from litellm import completion
 class BaseAgent(ABC):
     """Common lifecycle and LLM plumbing for agents."""
 
+    # How many times LiteLLM retries a failed completion (with backoff) before
+    # raising — smooths over transient per-minute provider rate limits.
+    NUM_RETRIES = 2
+
     def __init__(
         self,
         model: str | None = None,
@@ -78,7 +82,11 @@ class BaseAgent(ABC):
         messages.append({"role": "user", "content": prompt})
 
         try:
-            response = completion(model=self.model, messages=messages)
+            # num_retries lets LiteLLM back off and retry transient errors
+            # (e.g. per-minute rate limits) before surfacing the exception.
+            response = completion(
+                model=self.model, messages=messages, num_retries=self.NUM_RETRIES
+            )
             return response.choices[0].message.content
         except Exception as exc:
             print(f"❌ LLM call failed: {exc}")
@@ -101,6 +109,7 @@ class BaseAgent(ABC):
                 model=self.model,
                 messages=messages,
                 tools=self.tools or None,
+                num_retries=self.NUM_RETRIES,
             )
             msg = response.choices[0].message
 

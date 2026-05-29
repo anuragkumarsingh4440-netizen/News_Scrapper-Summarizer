@@ -32,12 +32,62 @@ def run_async(coro):
     return asyncio.run(coro)
 
 
-def provider_key_status() -> tuple[bool, str]:
-    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+def guard(coro):
+    """Run an LLM/pipeline coroutine, turning failures into friendly UI errors.
+
+    Returns the result, or None if it failed (and shows an st.error explaining
+    what happened — rate limits get a tailored message).
+    """
+    try:
+        return run_async(coro)
+    except Exception as exc:  # noqa: BLE001 - surface any failure to the user
+        msg = str(exc)
+        is_rate_limit = (
+            "RateLimit" in type(exc).__name__
+            or "429" in msg
+            or "RESOURCE_EXHAUSTED" in msg
+            or "quota" in msg.lower()
+        )
+        if is_rate_limit:
+            st.error(
+                "⛔ **LLM rate limit / quota hit.** The provider is throttling or "
+                "you've exhausted your quota.\n\n"
+                "**Fixes:** lower *Max articles to filter* in the sidebar, wait for "
+                "the quota window to reset, or switch the **Model** in the sidebar "
+                "to another provider you have a key for (e.g. "
+                "`claude-haiku-4-5-20251001` or `gpt-4o-mini`).\n\n"
+                "_Google's Gemini free tier allows only ~20 requests/day._"
+            )
+        else:
+            st.error(f"Pipeline error: {msg[:800]}")
+        with st.expander("Technical details"):
+            st.code(msg)
+        return None
+
+
+def key_for_model(model: str) -> str:
+    """Map a LiteLLM model string to the provider env var it needs."""
+    ml = model.lower()
+    if "gemini" in ml:
+        return "GEMINI_API_KEY"
+    if "claude" in ml or "anthropic" in ml:
+        return "ANTHROPIC_API_KEY"
+    if "gpt" in ml or "openai" in ml or ml.startswith("o1"):
+        return "OPENAI_API_KEY"
+    return ""
+
+
+def provider_key_status(model: str) -> tuple[bool, str]:
+    """Check whether the key the *current model* needs is configured."""
+    needed = key_for_model(model)
+    candidates = (
+        [needed] if needed else ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"]
+    )
+    for key in candidates:
         val = os.getenv(key)
         if val and not val.endswith("your_key_here"):
             return True, key
-    return False, ""
+    return False, needed or "ANTHROPIC_API_KEY/OPENAI_API_KEY/GEMINI_API_KEY"
 
 
 # --- Session state -----------------------------------------------------------
@@ -47,16 +97,21 @@ for k in ("articles", "filtered", "summary", "newsletter", "search", "evaluation
 # --- Sidebar -----------------------------------------------------------------
 st.sidebar.title("⚙️ Configuration")
 
-model = os.getenv("LITELLM_MODEL", "")
-st.sidebar.markdown(f"**Model:** `{model or 'not set'}`")
+model = st.sidebar.text_input(
+    "Model (LiteLLM string)",
+    value=os.getenv("LITELLM_MODEL", ""),
+    help=(
+        "Switch providers here without editing .env, e.g. "
+        "`claude-haiku-4-5-20251001`, `gpt-4o-mini`, or `gemini/gemini-2.5-flash-lite`. "
+        "The matching API key must be set in .env."
+    ),
+).strip()
 
-has_key, key_name = provider_key_status()
+has_key, key_name = provider_key_status(model)
 if has_key:
-    st.sidebar.success(f"API key detected: {key_name}")
+    st.sidebar.success(f"Using `{key_name}` for this model")
 else:
-    st.sidebar.error(
-        "No provider API key found. Set LITELLM_MODEL and a provider key in `.env`."
-    )
+    st.sidebar.error(f"No `{key_name}` found in .env for model `{model or 'not set'}`.")
 
 st.sidebar.divider()
 sources = st.sidebar.multiselect(
@@ -70,8 +125,11 @@ max_filter = st.sidebar.slider(
     "Max articles to send to the LLM filter",
     1,
     40,
-    10,
-    help="Each article is one LLM call — keep this modest to control cost/time.",
+    5,
+    help=(
+        "Each article is one LLM call. Keep this small on free tiers — "
+        "Gemini's free tier allows only ~20 requests/day."
+    ),
 )
 
 # --- Header ------------------------------------------------------------------
@@ -104,11 +162,14 @@ with tab_fetch:
             st.warning("Select at least one source in the sidebar.")
         else:
             with st.spinner("Fetching from sources..."):
-                articles = run_async(
+                articles = guard(
                     service.fetch_articles(sources, hn_limit=hn_limit, rss_feed=rss_feed)
                 )
-            st.session_state.articles = articles
-            st.success(f"Fetched {len(articles)} articles (also saved to the database).")
+            if articles is not None:
+                st.session_state.articles = articles
+                st.success(
+                    f"Fetched {len(articles)} articles (also saved to the database)."
+                )
 
     if st.session_state.articles:
         rows = [service.article_to_row(a) for a in st.session_state.articles]
@@ -133,13 +194,14 @@ with tab_filter:
             st.error("No API key configured.")
         else:
             with st.spinner(f"Filtering up to {max_filter} articles with the LLM..."):
-                result = run_async(
+                result = guard(
                     service.filter_articles(
                         st.session_state.articles, max_filter, model=model or None
                     )
                 )
-            st.session_state.filtered = result
-            st.success(f"Kept {result['kept']} of {result['considered']} articles.")
+            if result is not None:
+                st.session_state.filtered = result
+                st.success(f"Kept {result['kept']} of {result['considered']} articles.")
 
     if st.session_state.filtered:
         res = st.session_state.filtered
@@ -168,9 +230,9 @@ with tab_write:
                 st.error("No API key configured.")
             else:
                 with st.spinner("Summarizing by topic..."):
-                    st.session_state.summary = run_async(
-                        service.summarize(model=model or None)
-                    )
+                    summary = guard(service.summarize(model=model or None))
+                if summary is not None:
+                    st.session_state.summary = summary
         if st.session_state.summary:
             st.markdown(st.session_state.summary)
 
@@ -182,9 +244,9 @@ with tab_write:
                 st.error("No API key configured.")
             else:
                 with st.spinner("Writing the newsletter..."):
-                    st.session_state.newsletter = run_async(
-                        service.write_newsletter(model=model or None)
-                    )
+                    newsletter = guard(service.write_newsletter(model=model or None))
+                if newsletter is not None:
+                    st.session_state.newsletter = newsletter
         if st.session_state.newsletter:
             st.markdown(st.session_state.newsletter)
             st.download_button(
@@ -205,25 +267,30 @@ with tab_full:
             st.error("No API key configured.")
         else:
             progress = st.progress(0, text="Fetching...")
-            articles = run_async(
+            articles = guard(
                 service.fetch_articles(sources, hn_limit=hn_limit, rss_feed=rss_feed)
             )
-            st.session_state.articles = articles
-            progress.progress(30, text=f"Fetched {len(articles)} — filtering...")
+            if articles is not None:
+                st.session_state.articles = articles
+                progress.progress(30, text=f"Fetched {len(articles)} — filtering...")
 
-            st.session_state.filtered = run_async(
-                service.filter_articles(articles, max_filter, model=model or None)
-            )
-            progress.progress(60, text="Summarizing...")
+                filtered = guard(
+                    service.filter_articles(articles, max_filter, model=model or None)
+                )
+                if filtered is not None:
+                    st.session_state.filtered = filtered
+                    progress.progress(60, text="Summarizing...")
 
-            st.session_state.summary = run_async(service.summarize(model=model or None))
-            progress.progress(80, text="Writing newsletter...")
+                    summary = guard(service.summarize(model=model or None))
+                    if summary is not None:
+                        st.session_state.summary = summary
+                        progress.progress(80, text="Writing newsletter...")
 
-            st.session_state.newsletter = run_async(
-                service.write_newsletter(model=model or None)
-            )
-            progress.progress(100, text="Done!")
-            st.success("Pipeline complete — see the newsletter below.")
+                        newsletter = guard(service.write_newsletter(model=model or None))
+                        if newsletter is not None:
+                            st.session_state.newsletter = newsletter
+                            progress.progress(100, text="Done!")
+                            st.success("Pipeline complete — see the newsletter below.")
 
     if st.session_state.newsletter:
         st.markdown(st.session_state.newsletter)
@@ -242,7 +309,7 @@ with tab_search:
     query = st.text_input("Search query", "machine learning")
     if st.button("Search", type="primary", key="btn_search"):
         with st.spinner("Querying the MCP database server..."):
-            st.session_state.search = run_async(service.search(query, limit=20))
+            st.session_state.search = guard(service.search(query, limit=20))
 
     res = st.session_state.search
     if res:
@@ -274,9 +341,9 @@ with tab_eval:
             st.error("No API key configured.")
         else:
             with st.spinner("Evaluating against the golden dataset (10 LLM calls)..."):
-                st.session_state.evaluation = run_async(
-                    service.evaluate(model=model or None)
-                )
+                ev_result = guard(service.evaluate(model=model or None))
+            if ev_result is not None:
+                st.session_state.evaluation = ev_result
 
     ev = st.session_state.evaluation
     if ev:
