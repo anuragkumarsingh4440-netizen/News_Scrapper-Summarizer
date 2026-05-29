@@ -1,0 +1,56 @@
+"""Article data model.
+
+The single shared data structure that flows through the whole pipeline:
+fetchers produce ``Article`` objects, storage serializes them to markdown,
+and the agents read them back out.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+
+@dataclass
+class Article:
+    """Represents a news article.
+
+    Uses a dataclass for automatic ``__init__`` / ``__repr__`` / ``__eq__``.
+    """
+
+    title: str
+    url: str
+    published_at: datetime
+    source: str
+    summary: str = ""
+    score: int = 0
+
+    def __post_init__(self) -> None:
+        """Validate required fields after initialization."""
+        if not self.title:
+            raise ValueError("Article must have a title")
+        if not self.url:
+            raise ValueError("Article must have a URL")
+
+    def to_markdown(self) -> str:
+        """Convert article to a markdown section."""
+        return f"""## {self.title}
+
+**Source:** {self.source}
+**URL:** {self.url}
+**Published:** {self.published_at.strftime('%Y-%m-%d %H:%M')}
+**Score:** {self.score}
+
+{self.summary}
+"""
+
+
+if __name__ == "__main__":
+    article = Article(
+        title="Test Article",
+        url="https://example.com",
+        published_at=datetime.now(),
+        source="test",
+    )
+    print(article.to_markdown())
+    print("✅ Article model works!")

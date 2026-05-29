@@ -1,0 +1,1 @@
+"""Pluggable strategies (Strategy pattern)."""
